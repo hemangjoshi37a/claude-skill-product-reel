@@ -1,0 +1,17 @@
+# API keys — never commit
+.tmp/
+*key*
+!*.example.json
+
+# build artefacts
+.reel_build/
+promo/
+*.mp4
+*.mkv
+*.wav
+*.png
+!examples/*.png
+
+__pycache__/
+*.pyc
+.DS_Store

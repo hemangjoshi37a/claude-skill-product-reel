@@ -1,0 +1,33 @@
+{
+  "out_prefix": "widget-reel",
+  "images_dir": "images",
+  "out_dir": "promo",
+  "tmp_dir": ".reel_build",
+
+  "tts_provider": "openai",
+  "openai_key_file": ".tmp/openai_key",
+  "voice": "coral",
+  "tts_instructions": "Energetic, upbeat, confident. Punchy and fast-paced, with real enthusiasm. Emphasise key numbers.",
+
+  "languages": { "en": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" },
+
+  "company": {
+    "logo": "logo.png",
+    "contact_line": "acme.io   |   +1 555 010 1234",
+    "address": "123 Industrial Way, Springfield"
+  },
+
+  "music": null,
+  "multi_audio": false,
+
+  "scenes": [
+    {"image": "1.png", "vo": {"en": "Most workshops still do this by hand."}},
+    {"image": "2.png", "vo": {"en": "It takes four hours, and no two come out the same."}},
+    {"image": "3.png", "vo": {"en": "This machine does it in twenty minutes, identically, every time."}},
+    {"image": "4.png", "vo": {"en": "Zero point one millimeter repeatability, on all three axes."}},
+    {"image": "5.png", "vo": {"en": "No computer needed. Everything runs from the handheld pendant."}},
+    {"image": "1.png",
+     "vo":  {"en": "See it at acme dot i-o."},
+     "sub": {"en": "See it at acme.io"}}
+  ]
+}
