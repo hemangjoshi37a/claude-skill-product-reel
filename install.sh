@@ -28,9 +28,13 @@ echo "checking prerequisites"
 miss=0
 
 if command -v ffmpeg >/dev/null 2>&1; then
+  # Capture the filter list ONCE. Invoking ffmpeg per-filter is slower and can
+  # report a false "missing" if any single invocation returns truncated output.
+  FILTERS="$(ffmpeg -hide_banner -filters 2>/dev/null || true)"
   have=0
   for filt in xfade zoompan overlay sidechaincompress; do
-    if ffmpeg -hide_banner -filters 2>/dev/null | grep -qE "[A-Z.]+ +$filt +"; then
+    # flag column is 3 chars of mixed case and dots, e.g. ".S." / "TSC" / "..C"
+    if printf '%s\n' "$FILTERS" | grep -qE "^[[:space:]]*[A-Za-z.]{3}[[:space:]]+${filt}[[:space:]]"; then
       have=$((have + 1))
     else
       echo "  MISSING ffmpeg filter: $filt"
