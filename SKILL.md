@@ -71,6 +71,15 @@ Image prompt rules that worked well:
   touches the work". This fixes the common "second floating tool / bent tool" artifact.
 - Text renders reliably; keep numbers/URLs/phones spelled exactly in the prompt.
 
+### Pacing: never hold one visual too long
+A scene's `"image"` accepts a **list** of filenames as well as a single one. With a
+list, the scene hard-cuts between the images (equal time splits, each with its own
+Ken-Burns direction). Viewers skip when a frame sits still: aim for **2-4 seconds
+per visual** — give any scene whose voiceover runs longer than ~4s a second (or
+third) image. Vary the page/angle across scenes (product, close-up crop, UI page,
+in-action shot) so consecutive scenes never show near-identical frames. A
+deliberate long hold is fine ONLY for the final CTA card.
+
 ### 2. Write the reel scene script
 Aim for a scroll-stopping **hook** first, then reveal → specs → applications → CTA.
 Keep each line short (one idea). Write it in every target language (natural, not

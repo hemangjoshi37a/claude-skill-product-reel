@@ -528,14 +528,28 @@ def build(cfg, dur):
     # (contained with head-room, no crop). Hi-res source => jitter-free zoompan.
     SS = cfg["zoom_ss"]; SGW, SGH = STAGE_W * SS, STAGE_H * SS
     inner_w, inner_h = int(SGW / MZ) - 8 * SS, int(SGH / MZ) - 8 * SS
-    stage = []
-    for i, sc in enumerate(cfg["scenes"]):
-        p = f"{cfg['tmp_dir']}/stage_{i}.png"
-        prod = Image.open(os.path.join(cfg["images_dir"], sc["image"])).convert("RGBA")
-        prod = contain(prod, inner_w, inner_h)
-        st = Image.new("RGB", (SGW, SGH), BGRGB)
-        st.paste(prod, ((SGW - prod.width) // 2, (SGH - prod.height) // 2), prod)
-        st.save(p); stage.append(p)
+    # A scene's "image" may be a single filename OR a list of filenames: with a
+    # list, the scene cuts between the images (equal splits, each with its own
+    # Ken-Burns) so no visual holds longer than a few seconds — better retention.
+    def scene_images(sc):
+        im = sc["image"]
+        return list(im) if isinstance(im, (list, tuple)) else [im]
+
+    _stage_cache = {}
+
+    def stage_for(img):
+        if img not in _stage_cache:
+            p = f"{cfg['tmp_dir']}/stage_{_content_key('stage1', img, _file_key(os.path.join(cfg['images_dir'], img)), SS, MZ)}.png"
+            if not os.path.exists(p):
+                prod = Image.open(os.path.join(cfg["images_dir"], img)).convert("RGBA")
+                prod = contain(prod, inner_w, inner_h)
+                st = Image.new("RGB", (SGW, SGH), BGRGB)
+                st.paste(prod, ((SGW - prod.width) // 2, (SGH - prod.height) // 2), prod)
+                st.save(p)
+            _stage_cache[img] = p
+        return _stage_cache[img]
+
+    stage = [[stage_for(im) for im in scene_images(sc)] for sc in cfg["scenes"]]
 
     def timings(lang):
         return _schedule(cfg, N, dur[lang])
@@ -600,8 +614,9 @@ def build(cfg, dur):
         for i, sc in enumerate(cfg["scenes"]):
             gi = 0.55 + 0.45 * abs(math.sin(i * 0.9))          # logo shimmer across scenes
             disp = (sc.get("sub") or {}).get(lang) or sc["vo"][lang]   # caption may differ from VO
-            img_key = _file_key(os.path.join(cfg["images_dir"], sc["image"]))
-            clip_key = _content_key("clip1", lang, disp, f"{sd[i]:.3f}", img_key, logo_key,
+            imgs = scene_images(sc)
+            img_keys = "|".join(_file_key(os.path.join(cfg["images_dir"], p)) for p in imgs)
+            clip_key = _content_key("clip2", lang, disp, f"{sd[i]:.3f}", img_keys, logo_key,
                                     cfg["languages"][lang], cfg["company"].get("contact_line"),
                                     cfg["company"].get("address"), cfg["maxzoom"], cfg["fps"])
             out = f"{cfg['tmp_dir']}/clip_{lang}_{i}_{clip_key}.mp4"
@@ -609,14 +624,29 @@ def build(cfg, dur):
                 print(f"  clip {lang}{i}: cached", flush=True)
                 clips.append(out); continue
             ovp = f"{cfg['tmp_dir']}/ov_{lang}_{i}.png"; overlay(disp, lang, gi, ovp)
-            frames = max(1, round(sd[i] * FPS)); rate = (MZ - 1) / frames
-            z = (f"min(1.0+{rate:.6f}*on,{MZ})" if i % 2 == 0
-                 else f"max({MZ}-{rate:.6f}*on,1.0)")           # alternate in / out
-            fc = _kenburns_fc(cfg, sd[i], z, STAGE_W, STAGE_H, STAGE_X, STAGE_Y, W, H, FPS)
-            subprocess.run(["ffmpeg", "-y", "-loop", "1", "-t", str(sd[i]), "-i", stage[i],
-                            "-loop", "1", "-t", str(sd[i]), "-i", ovp, "-filter_complex", fc,
-                            "-map", "[out]", "-r", str(FPS), "-pix_fmt", "yuv420p", "-c:v", "libx264",
-                            "-preset", "veryfast", "-crf", "20", out], check=True, capture_output=True)
+            total_frames = max(len(imgs), round(sd[i] * FPS))
+            base_f, extra = divmod(total_frames, len(imgs))
+            parts = []
+            for j, sp in enumerate(stage[i]):
+                fj = base_f + (1 if j < extra else 0)
+                pdur = fj / FPS
+                rate = (MZ - 1) / fj
+                z = (f"min(1.0+{rate:.6f}*on,{MZ})" if (i + j) % 2 == 0
+                     else f"max({MZ}-{rate:.6f}*on,1.0)")       # alternate in / out
+                pout = out if len(imgs) == 1 else f"{cfg['tmp_dir']}/part_{lang}_{i}p{j}_{clip_key}.mp4"
+                fc = _kenburns_fc(cfg, pdur, z, STAGE_W, STAGE_H, STAGE_X, STAGE_Y, W, H, FPS)
+                subprocess.run(["ffmpeg", "-y", "-loop", "1", "-t", f"{pdur:.4f}", "-i", sp,
+                                "-loop", "1", "-t", f"{pdur:.4f}", "-i", ovp, "-filter_complex", fc,
+                                "-map", "[out]", "-r", str(FPS), "-pix_fmt", "yuv420p", "-c:v", "libx264",
+                                "-preset", "veryfast", "-crf", "20", pout], check=True, capture_output=True)
+                parts.append(pout)
+            if len(parts) > 1:
+                lst = f"{cfg['tmp_dir']}/cc_{lang}_{i}.txt"
+                with open(lst, "w") as f:
+                    for p in parts:
+                        f.write(f"file '{os.path.abspath(p)}'\n")
+                subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                                "-c", "copy", out], check=True, capture_output=True)
             clips.append(out)
         inp = []
         for c in clips:
