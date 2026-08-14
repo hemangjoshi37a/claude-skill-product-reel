@@ -29,6 +29,7 @@ captions are Pillow-rendered), Pillow, google-genai, a Gemini API key.
 
 Usage:  python build_reel.py config.json
 """
+import hashlib
 import json, math, os, subprocess, sys, time, wave
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -126,6 +127,33 @@ def load_cfg(path):
     return cfg
 
 
+def _content_key(*parts):
+    """Short stable key of the given parts — used to name cached artifacts so a
+    change in any input (text, voice, image bytes, duration...) yields a new
+    filename and an automatic, surgical re-generation of just that artifact."""
+    h = hashlib.sha1()
+    for p in parts:
+        h.update(str(p).encode()); h.update(b"\x00")
+    return h.hexdigest()[:12]
+
+
+def _file_key(path):
+    try:
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 16), b""):
+                h.update(chunk)
+        return h.hexdigest()[:12]
+    except (OSError, TypeError):
+        return "missing"
+
+
+def _adopt_legacy(legacy, hashed):
+    """One-time migration: adopt a pre-hash cache file for the current inputs."""
+    if not os.path.exists(hashed) and os.path.exists(legacy):
+        os.replace(legacy, hashed)
+
+
 def _rgb(hexish):
     h = str(hexish).replace("0x", "").replace("#", "")
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
@@ -201,10 +229,14 @@ def gen_tts_gemini(cfg):
 
     for l in langs:
         for i, sc in enumerate(cfg["scenes"]):
-            out = f"{cfg['tmp_dir']}/{l}{i}.wav"
+            key = _content_key("tts1", "gemini", cfg["tts_model"], cfg["voice"], sc["vo"][l])
+            out = f"{cfg['tmp_dir']}/{l}{i}_{key}.wav"
+            _adopt_legacy(f"{cfg['tmp_dir']}/{l}{i}.wav", out)
+            cfg.setdefault("_wav", {}).setdefault(l, {})[i] = out
             d, called = one(sc["vo"][l], out)
             dur[l].append(d)
-            print(f"  tts {l}{i}: {'MISSING(quota)' if d is None else f'{d:.1f}s'}", flush=True)
+            src = "gen" if called else "cached"
+            print(f"  tts {l}{i}: {'MISSING(quota)' if d is None else f'{d:.1f}s ({src})'}", flush=True)
             if called:
                 time.sleep(cfg.get("tts_throttle", 6.0))   # stay under the per-minute limit
 
@@ -302,7 +334,10 @@ def gen_tts_openai(cfg):
 
     for l in langs:
         for i, sc in enumerate(cfg["scenes"]):
-            out = f"{cfg['tmp_dir']}/{l}{i}.wav"
+            key = _content_key("tts1", "openai", cfg.get("tts_model", ""), cfg["voice"], sc["vo"][l])
+            out = f"{cfg['tmp_dir']}/{l}{i}_{key}.wav"
+            _adopt_legacy(f"{cfg['tmp_dir']}/{l}{i}.wav", out)
+            cfg.setdefault("_wav", {}).setdefault(l, {})[i] = out
             d, called = one(sc["vo"][l], out)
             dur[l].append(d)
             print(f"  tts {l}{i}: {'MISSING' if d is None else f'{d:.1f}s'}", flush=True)
@@ -321,7 +356,10 @@ def gen_tts_openai(cfg):
 def make_music(cfg, seconds):
     if cfg["music"]:
         return cfg["music"]
-    out = f"{cfg['tmp_dir']}/music.wav"
+    out = f"{cfg['tmp_dir']}/music_{int(seconds)}.wav"
+    if os.path.exists(out) and os.path.getsize(out) > 1000:
+        print("  music: cached", flush=True)
+        return out
     # Warm, MID-BAND A-minor pad (phone speakers can't reproduce <150 Hz, so the
     # earlier low-only bed was inaudible). Notes spread 220-660 Hz + a soft shimmer,
     # gentle movement + reverb. 100% original / license-free.
@@ -555,16 +593,25 @@ def build(cfg, dur):
             d.text(((W - w2) // 2, 1862), addr, font=f2, fill=GREY)
         ov.save(path)
 
+    logo_key = _file_key(cfg["company"].get("logo") or "")
+
     def video(lang, sd):
         clips = []
         for i, sc in enumerate(cfg["scenes"]):
             gi = 0.55 + 0.45 * abs(math.sin(i * 0.9))          # logo shimmer across scenes
             disp = (sc.get("sub") or {}).get(lang) or sc["vo"][lang]   # caption may differ from VO
+            img_key = _file_key(os.path.join(cfg["images_dir"], sc["image"]))
+            clip_key = _content_key("clip1", lang, disp, f"{sd[i]:.3f}", img_key, logo_key,
+                                    cfg["languages"][lang], cfg["company"].get("contact_line"),
+                                    cfg["company"].get("address"), cfg["maxzoom"], cfg["fps"])
+            out = f"{cfg['tmp_dir']}/clip_{lang}_{i}_{clip_key}.mp4"
+            if os.path.exists(out) and os.path.getsize(out) > 10000:
+                print(f"  clip {lang}{i}: cached", flush=True)
+                clips.append(out); continue
             ovp = f"{cfg['tmp_dir']}/ov_{lang}_{i}.png"; overlay(disp, lang, gi, ovp)
             frames = max(1, round(sd[i] * FPS)); rate = (MZ - 1) / frames
             z = (f"min(1.0+{rate:.6f}*on,{MZ})" if i % 2 == 0
                  else f"max({MZ}-{rate:.6f}*on,1.0)")           # alternate in / out
-            out = f"{cfg['tmp_dir']}/clip_{lang}_{i}.mp4"
             fc = _kenburns_fc(cfg, sd[i], z, STAGE_W, STAGE_H, STAGE_X, STAGE_Y, W, H, FPS)
             subprocess.run(["ffmpeg", "-y", "-loop", "1", "-t", str(sd[i]), "-i", stage[i],
                             "-loop", "1", "-t", str(sd[i]), "-i", ovp, "-filter_complex", fc,
@@ -588,7 +635,7 @@ def build(cfg, dur):
     def mux(lang, vid, starts, total):
         inp = []
         for i in range(N):
-            inp += ["-i", f"{cfg['tmp_dir']}/{lang}{i}.wav"]
+            inp += ["-i", cfg["_wav"][lang][i]]
         parts = [f"[{i}:a]adelay={int(starts[i] * 1000)}|{int(starts[i] * 1000)}[a{i}]" for i in range(N)]
         vo_norm = f",loudnorm=I={cfg['vo_loudnorm_i']}:TP=-1.5:LRA=11" if cfg.get("vo_loudnorm_i") is not None else ""
         vof = (";".join(parts) + ";" + "".join(f"[a{i}]" for i in range(N)) +
@@ -657,7 +704,7 @@ def build(cfg, dur):
         for lang in bl:
             ina = []
             for i in range(N):
-                ina += ["-i", f"{cfg['tmp_dir']}/{lang}{i}.wav"]
+                ina += ["-i", cfg["_wav"][lang][i]]
             parts = [f"[{i}:a]adelay={int(starts[i] * 1000)}|{int(starts[i] * 1000)}[a{i}]" for i in range(N)]
             vo_norm = f",loudnorm=I={cfg['vo_loudnorm_i']}:TP=-1.5:LRA=11" if cfg.get("vo_loudnorm_i") is not None else ""
             vof = (";".join(parts) + ";" + "".join(f"[a{i}]" for i in range(N)) +

@@ -1,41 +1,25 @@
 {
-  "_paths": "images_dir / out_dir / tmp_dir / gemini_key_file / openai_key_file are resolved relative to THIS config file's directory (not the shell CWD). Keep them PROJECT-LOCAL: never point tmp_dir or out_dir at /tmp or /var/tmp, which are wiped on reboot and destroy the resumable TTS + render progress.",
-
-  "out_prefix": "acme-widget-reel",
-  "images_dir": "images",
+  "_paths": "images_dir / out_dir / tmp_dir / gemini_key_file are resolved relative to THIS config file's directory (not the shell CWD). Keep them PROJECT-LOCAL: never point tmp_dir or out_dir at /tmp or /var/tmp, which are wiped on reboot and destroy the resumable TTS + render progress.",
+  "out_prefix": "hjlabs-reel",
+  "images_dir": "promo",
   "out_dir": "promo",
   "tmp_dir": ".reel_build",
-
-  "_providers": "Pick ONE TTS provider. Gemini is the default and needs gemini_key_file. For OpenAI set tts_provider to 'openai' and supply openai_key_file; voice then takes an OpenAI voice name (alloy, ash, ballad, coral, echo, fable, onyx, nova, sage, shimmer, verse) and tts_instructions can steer the delivery.",
   "gemini_key_file": ".tmp/gkey",
-
   "voice": "Sulafat",
-
-  "_voice_note": "Gemini voices: Puck (upbeat), Charon (informative), Kore (firm), Aoede/Zephyr (bright), Sulafat (warm).",
-
   "languages": {
     "en": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "hi": "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf"
   },
-
-  "_fonts": "One BOLD font per language, covering that script. Check coverage with: fc-list :lang=hi",
-
   "company": {
     "logo": "logo.png",
-    "contact_line": "acme.io   |   +1 555 010 1234",
-    "address": "123 Industrial Way, Springfield"
+    "contact_line": "hjLabs.in   |   +91 70165 25813",
+    "address": "B-89 Gezia GIDC, Sector 25, Gandhinagar, Gujarat"
   },
-
   "music": null,
   "multi_audio": true,
-
-  "_scenes": "One scene per spoken line. Each becomes a subtitle AND a voiceover segment, and the scene is timed to its longest-language voiceover. Aim for 16-18 lines (~60-75s). Spell numbers out so TTS reads them naturally ('zero point zero one millimeter'). Add an optional per-language 'sub' when the on-screen caption should differ from the spoken words.",
-
   "scenes": [
     {"image": "3.png", "vo": {"en": "What if your circuit boards could solder themselves, perfectly, every single time?", "hi": "अगर आपके सर्किट बोर्ड खुद-ब-खुद, हर बार बिल्कुल सही सोल्डर हो जाएँ तो?"}},
-    {"image": "1.png",
-     "vo":  {"en": "Meet the acme dot i-o automatic soldering station.", "hi": "मिलिए एक्मे डॉट आई-ओ की ऑटोमैटिक सोल्डरिंग मशीन से।"},
-     "sub": {"en": "Meet the acme.io automatic soldering station.",      "hi": "मिलिए acme.io की ऑटोमैटिक सोल्डरिंग मशीन से।"}},
+    {"image": "1.png", "vo": {"en": "Meet the hjLabs dot in automatic soldering station.", "hi": "मिलिए एच.जे.लैब्स डॉट इन की ऑटोमैटिक सोल्डरिंग मशीन से।"}, "sub": {"en": "Meet the hjLabs.in automatic soldering station.", "hi": "मिलिए hjLabs.in की ऑटोमैटिक सोल्डरिंग मशीन से।"}},
     {"image": "app-1-connectors.png", "vo": {"en": "It's a programmable, selective soldering robot that does the whole job for you.", "hi": "यह एक प्रोग्रामेबल, सिलेक्टिव सोल्डरिंग रोबोट है, जो पूरा काम खुद करता है।"}},
     {"image": "2.png", "vo": {"en": "Every joint is placed with zero point zero one millimeter accuracy, on all three axes.", "hi": "हर जॉइंट, तीनों एक्सिस पर ज़ीरो पॉइंट ज़ीरो वन मिलीमीटर की सटीकता से लगता है।"}},
     {"image": "app-2-led.png", "vo": {"en": "So even your tightest, most delicate boards come out flawless.", "hi": "इसलिए आपके सबसे बारीक और नाज़ुक बोर्ड भी बिल्कुल परफेक्ट बनते हैं।"}},
@@ -50,8 +34,6 @@
     {"image": "app-4-battery-bms.png", "vo": {"en": "battery packs and BMS modules,", "hi": "बैटरी पैक और बी.एम.एस. मॉड्यूल,"}},
     {"image": "app-5-iot-sensors.png", "vo": {"en": "even IoT and sensor boards.", "hi": "यहाँ तक कि आई.ओ.टी. और सेंसर बोर्ड भी।"}},
     {"image": "5.png", "vo": {"en": "Control it over WiFi from our web app, with wireless updates and hands-free foot-pedal.", "hi": "वाई-फ़ाई से हमारे वेब ऐप पर कंट्रोल कीजिए, वायरलेस अपडेट और हैंड्स-फ्री फुट-पेडल के साथ।"}},
-    {"image": "1.png",
-     "vo":  {"en": "Automate your soldering today, with acme dot i-o.", "hi": "आज ही अपनी सोल्डरिंग ऑटोमेट कीजिए, एक्मे डॉट आई-ओ के साथ।"},
-     "sub": {"en": "Automate your soldering today, with acme.io.",      "hi": "आज ही अपनी सोल्डरिंग ऑटोमेट कीजिए, acme.io के साथ।"}}
+    {"image": "1.png", "vo": {"en": "Automate your soldering today, with hjLabs dot in.", "hi": "आज ही अपनी सोल्डरिंग ऑटोमेट कीजिए, एच.जे.लैब्स डॉट इन के साथ।"}, "sub": {"en": "Automate your soldering today, with hjLabs.in.", "hi": "आज ही अपनी सोल्डरिंग ऑटोमेट कीजिए, hjLabs.in के साथ।"}}
   ]
 }

@@ -106,9 +106,14 @@ It generates TTS per scene (retried), times each scene to its longest-language
 voiceover, renders per-scene clips (image + Ken-Burns on a branded canvas + logo +
 subtitle + footer overlay), stitches them with crossfade/slide transitions, and muxes
 voiceover + side-chain-ducked music. Output: `out_dir/<out_prefix>-<lang>.mp4`.
-**This is slow** (TTS + ~2 clip renders per scene per language). If it risks the tool
-timeout, run it in the background. It is **resumable** — it re-reads existing `.wav`
-and clip files, so re-running only does the missing work.
+**This is slow on the first run** (TTS + ~2 clip renders per scene per language) —
+run it in the background if it risks the tool timeout. Every artifact is cached in
+`tmp_dir` under a **content-hash filename** (voice+text for audio, image-bytes+
+caption+duration+branding for clips, duration for music), so re-runs are
+**surgically incremental**: edit one scene's text and ONLY that scene's audio is
+regenerated; swap one image and ONLY that scene's clips re-encode; everything
+untouched is reused as-is. A no-change re-run only re-stitches and re-muxes
+(seconds, no API calls). Never delete `tmp_dir` between iterations.
 
 ### 5. Review + iterate
 Extract frames to check layout/sync:
@@ -135,9 +140,11 @@ that; don't drop the supersample.
 ## Gotchas learned
 - **Gemini TTS daily quota.** `gemini-2.5-flash-preview-tts` free tier = **100
   requests / model / DAY** (a 429 `RESOURCE_EXHAUSTED` with `per_day` in the message;
-  resets ~24 h later). The builder is **RESUMABLE** — it keeps each clip at
-  `<tmp_dir>/{lang}{i}.wav` (e.g. `.reel_build/en0.wav`) and only generates the ones
-  that are missing, so re-running after the quota resets finishes cheaply.
+  resets ~24 h later). The builder caches each voiceover at
+  `<tmp_dir>/{lang}{i}_<hash>.wav` where the hash covers provider+model+voice+text —
+  a cached clip is NEVER regenerated unless its text or voice changes, and a legacy
+  index-named `{lang}{i}.wav` is adopted automatically on first run. Re-running
+  after a quota reset generates only what is genuinely missing.
 - **Durability: keep `tmp_dir` and `out_dir` PROJECT-LOCAL — never `/tmp`.** That
   resumability is only worth something if the files survive. `tmp_dir` holds hours of
   quota-limited TTS and slow renders; `/tmp` and `/var/tmp` are erased on reboot or
@@ -165,7 +172,7 @@ Copy `config.example.json`, then change:
 - `voice` — the Gemini voice,
 - the `scenes` array — one entry per scene: `image` plus a per-language `vo` (the
   spoken line); add an optional per-language `sub` when the on-screen caption should
-  differ from the spoken words (e.g. show "acme.io" but speak "acme dot i-o").
+  differ from the spoken words (e.g. show "hjLabs.in" but speak "hjLabs dot in").
 
 Everything else (scene timing, transitions, ducked music, subtitle/footer layout,
 optional MKV master) is automatic.
