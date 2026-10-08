@@ -32,6 +32,10 @@ Usage:  python build_reel.py config.json
 import hashlib
 import json, math, os, subprocess, sys, time, wave
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+try:
+    import numpy as _np
+except ImportError:                              # the pad bed still works
+    _np = None
 
 
 VOLATILE_ROOTS = ("/tmp", "/var/tmp")            # wiped on reboot — never keep work here
@@ -98,23 +102,44 @@ def load_cfg(path):
     cfg.setdefault("duck_threshold", 0.055)
     cfg.setdefault("duck_ratio", 3)
     cfg.setdefault("duck_attack", 25)
-    cfg.setdefault("duck_release", 420)
+    # 420 ms was a film release: the bed crept back so slowly that the space
+    # between two lines stayed quiet AND flat, which is the other half of why a
+    # cut with no measurable silence still gets reported as full of it. At
+    # 170 ms the beat is back before the next line starts, so the gap carries
+    # the track instead of waiting for it.
+    cfg.setdefault("duck_release", 170)
     cfg.setdefault("vo_loudnorm_i", None)         # e.g. -16: loudnorm the VO stem alone before
                                                    # mixing with music, so it reliably dominates.
                                                    # None (default) = no VO-only normalization,
                                                    # i.e. exactly today's behaviour.
-    cfg.setdefault("maxzoom", 1.06)               # Ken-Burns head-room (gentle = calmer, no crop)
+    # ---------------------------------------------------------------- pacing
+    #
+    # These were all tuned for a calm product film and they made REELS that
+    # died on the vine. Measured on a 13-scene cut with the old values: 12% of
+    # the running time was silence, arriving as a ~0.7 s hole between every
+    # single line (0.32 vo_pad + 0.5 s dissolve). A viewer reads that as the
+    # video buffering, and buffering is a scroll.
+    #
+    # A reel is not a film. The eye is already moving; anything that waits gets
+    # left behind. Every default below is now set for a feed, and every one of
+    # them is still a knob — a project that genuinely wants the calm cut sets
+    # "pace": "calm" and gets the old numbers back exactly.
+    PACE = {
+        "reel":  dict(vo_pad=0.10, vo_offset=0.08, vo_min_gap=0.06, min_scene=1.1,
+                      last_tail=0.85, maxzoom=1.16, max_hold=2.6, xfade=0.12),
+        "calm":  dict(vo_pad=0.32, vo_offset=0.14, vo_min_gap=0.25, min_scene=1.9,
+                      last_tail=1.3, maxzoom=1.06, max_hold=99.0, xfade=0.5),
+    }
+    pace = PACE.get(cfg.setdefault("pace", "reel"), PACE["reel"])
+    for k, v in pace.items():
+        cfg.setdefault(k, v)
+
     cfg.setdefault("zoom_ss", 2)                  # supersample factor — kills zoompan jitter/shake
-    cfg.setdefault("min_scene", 1.9)              # floor for a scene (s)
-    cfg.setdefault("vo_pad", 0.32)                # gap after an inner VO line (s)
-    cfg.setdefault("vo_offset", 0.14)             # VO starts this long after a scene appears
-    cfg.setdefault("vo_min_gap", 0.25)            # UNCONDITIONAL bugfix knob, not opt-in — see
-                                                   # _schedule() below: this is the minimum silent
-                                                   # gap enforced between one line ending and the
-                                                   # next starting. Every existing config gets this
-                                                   # fix too (see report: it changes output timing
-                                                   # for any project where an overlap was occurring).
-    cfg.setdefault("last_tail", 1.3)              # extra tail after the FINAL line (s)
+    # How long one still may hold before the builder cuts it into its own
+    # sub-shots. A static frame is dead air with pictures on it: past about
+    # two and a half seconds the viewer has finished reading it and is looking
+    # for the next thing. See _plan_stills().
+    cfg.setdefault("max_hold", 2.6)
     cfg.setdefault("logo_w", 430)
     cfg.setdefault("logo_glow", (120, 225, 255))  # cyan-white halo
     for k in ("tmp_dir", "out_dir", "images_dir"):
@@ -148,10 +173,37 @@ def _file_key(path):
         return "missing"
 
 
+def _trim_silence(path):
+    """Strip leading and trailing silence so lines butt up tightly.
+
+    The Gemini path has always done this inline. Nothing else did — so a clip
+    that arrived any OTHER way (the OpenAI provider, or one dropped in
+    pre-rendered under the legacy name) kept whatever head and tail its
+    synthesiser felt like adding. That silence is then paid TWICE: once as the
+    hole you hear, and again as scene length, because every scene is timed to
+    its own voiceover. Trim once, where a clip enters the cache, whoever made
+    it."""
+    t = path + ".trim.wav"
+    af = ("silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.03:detection=peak,"
+          "areverse,"
+          "silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.05:detection=peak,"
+          "areverse")
+    r = subprocess.run(["ffmpeg", "-y", "-i", path, "-af", af, t], capture_output=True)
+    if r.returncode == 0 and os.path.exists(t) and os.path.getsize(t) > 1000:
+        os.replace(t, path)
+    elif os.path.exists(t):
+        os.remove(t)
+
+
 def _adopt_legacy(legacy, hashed):
-    """One-time migration: adopt a pre-hash cache file for the current inputs."""
+    """One-time migration: adopt a pre-hash cache file for the current inputs.
+
+    Adopted clips are TRIMMED on the way in. A pre-rendered voiceover is the one
+    kind the builder never spoke itself, so it is also the one kind whose
+    silence nothing had ever taken off."""
     if not os.path.exists(hashed) and os.path.exists(legacy):
         os.replace(legacy, hashed)
+        _trim_silence(hashed)
 
 
 def _rgb(hexish):
@@ -360,9 +412,28 @@ def make_music(cfg, seconds):
     if os.path.exists(out) and os.path.getsize(out) > 1000:
         print("  music: cached", flush=True)
         return out
-    # Warm, MID-BAND A-minor pad (phone speakers can't reproduce <150 Hz, so the
-    # earlier low-only bed was inaudible). Notes spread 220-660 Hz + a soft shimmer,
-    # gentle movement + reverb. 100% original / license-free.
+    # A bed with a PULSE, not a drone.
+    #
+    # This used to be seven sustained sine tones under a slow tremolo — a pad.
+    # A pad is the correct bed for a product film and the wrong one for a reel,
+    # and the symptom is oddly specific: the cut gets reported as "too much
+    # silence between the lines" when measurement shows the voice track has no
+    # silence in it at all. What is missing is not sound, it is EVENTS. With a
+    # drone, nothing happens between one line and the next, so the gap plays as
+    # dead air. Give the bed a beat and the same gap becomes momentum — the
+    # thing people mean when they say a reel carries them.
+    #
+    # So: a four-on-the-floor pulse, an off-beat tick, a bass that moves every
+    # bar, and a quiet pad for body — with the whole thing getting denser as it
+    # runs, so the end feels like arrival rather than just the end. Synthesised
+    # here, which means it is 100% original and cleared for paid ads; third
+    # party "free" tracks almost always want attribution and are not.
+    if _np is not None:
+        try:
+            return _synth_bed(cfg, out, seconds)
+        except Exception as exc:                   # never fail a build over music
+            print(f"  music: synth failed ({exc}); falling back to the pad", flush=True)
+
     freqs = [220, 261.63, 329.63, 392.0, 440.0, 523.25, 659.25]
     inp = []
     for f in freqs:
@@ -376,6 +447,99 @@ def make_music(cfg, seconds):
           f"loudnorm=I=-20:TP=-2:LRA=11,volume=1.0[a]")
     subprocess.run(["ffmpeg", "-y"] + inp + ["-filter_complex", fc, "-map", "[a]",
                     "-t", str(seconds), "-c:a", "pcm_s16le", out], check=True, capture_output=True)
+    return out
+
+
+# ---------------------------------------------------------------- music synth
+def _synth_bed(cfg, out, seconds, sr=44100):
+    """A driving, original bed: pulse + off-beat tick + moving bass + pad.
+
+    Written with numpy rather than an ffmpeg filtergraph because the thing that
+    makes a reel carry — a beat that arrives ON TIME, every time, and a
+    density that builds — is a sequencer problem, and expressing a sequencer as
+    a chain of `sine=` inputs is how you end up with a drone instead.
+
+    Everything is generated from first principles, so the result is original
+    and cleared for paid advertising. Third-party "royalty free" tracks almost
+    always require attribution and are not cleared for ads.
+    """
+    bpm = float(cfg.get("music_bpm", 104))
+    beat = 60.0 / bpm
+    n = int(seconds * sr)
+    t = _np.arange(n) / sr
+    mix = _np.zeros(n, dtype=_np.float64)
+
+    def place(buf, start_s, wave):
+        i = int(start_s * sr)
+        if i >= n:
+            return
+        k = min(len(wave), n - i)
+        buf[i:i + k] += wave[:k]
+
+    def env(length_s, attack=0.002, decay=None):
+        m = int(length_s * sr)
+        e = _np.ones(m)
+        a = max(1, int(attack * sr))
+        e[:a] = _np.linspace(0, 1, a)
+        d = decay if decay is not None else length_s
+        e *= _np.exp(-_np.arange(m) / (d * sr))
+        return e
+
+    # A minor, because it is the key the old pad was in and it suits a dark
+    # brand palette. One chord change per four bars keeps it moving without
+    # ever pulling focus from the voice.
+    roots = [110.00, 146.83, 130.81, 164.81]        # A2  D3  C3  E3
+    bars = max(1, int(seconds / (beat * 4)) + 1)
+
+    for b in range(bars):
+        bar_t = b * beat * 4
+        root = roots[(b // 4) % len(roots)]
+        # how far through the reel this bar is — the bed thickens as it goes
+        grow = min(1.0, 0.45 + 0.55 * (bar_t / max(1.0, seconds)))
+
+        for k in range(4):
+            bt = bar_t + k * beat
+            if bt > seconds:
+                break
+            # kick: a short pitch-dropping sine. Mid-low, because a phone
+            # speaker cannot reproduce the sub-100 Hz where a real kick lives.
+            m = int(0.15 * sr)
+            f = 150 * _np.exp(-_np.arange(m) / (0.035 * sr)) + 72
+            ph = _np.cumsum(2 * _np.pi * f / sr)
+            place(mix, bt, _np.sin(ph) * env(0.15, 0.001, 0.055) * 0.55 * grow)
+
+            # off-beat tick: filtered noise, the thing that actually creates
+            # the sense of forward motion between the kicks.
+            if b > 1:
+                mnz = int(0.06 * sr)
+                nz = _np.random.default_rng(b * 4 + k).standard_normal(mnz)
+                nz = _np.convolve(nz, _np.array([1.0, -0.92]), mode="same")
+                place(mix, bt + beat * 0.5, nz * env(0.06, 0.001, 0.018) * 0.10 * grow)
+
+            # bass: one note per beat, root and fifth alternating
+            bf = root if k % 2 == 0 else root * 1.5
+            m = int(beat * 0.92 * sr)
+            bw = _np.sin(2 * _np.pi * bf * _np.arange(m) / sr)
+            bw += 0.3 * _np.sin(2 * _np.pi * bf * 2 * _np.arange(m) / sr)
+            place(mix, bt, bw * env(beat * 0.92, 0.006, beat * 0.30) * 0.26 * grow)
+
+    # pad: quiet, wide, just enough to stop the gaps sounding like a drum
+    # machine in an empty room.
+    for f in (220.0, 329.63, 440.0):
+        mix += _np.sin(2 * _np.pi * f * t + _np.sin(2 * _np.pi * 0.08 * t)) * 0.035
+
+    # tops and tails
+    fade = int(0.6 * sr)
+    mix[:fade] *= _np.linspace(0, 1, fade)
+    tail = int(min(2.2, seconds * 0.1) * sr)
+    mix[-tail:] *= _np.linspace(1, 0, tail)
+
+    peak = float(_np.max(_np.abs(mix))) or 1.0
+    pcm = (mix / peak * 0.82 * 32767).astype("<i2")
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        w.writeframes(pcm.tobytes())
+    print(f"  music: synthesised {seconds:.0f}s bed at {bpm:g} BPM", flush=True)
     return out
 
 
@@ -452,23 +616,69 @@ def _srt_t(sec):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def _kenburns_fc(cfg, dur_s, z, SW, SH, SX, SY, W, H, FPS):
+#: Where each shot drifts, as a fraction of the head-room the zoom opens up.
+#: A pure centred zoom is the thing people mean by "it looks like a slideshow":
+#: nothing in the frame CHANGES RELATIVE to anything else, so the eye reads it
+#: as a still that is slowly getting bigger. A drift across the frame is what
+#: makes it read as a camera move — and cycling the direction shot to shot is
+#: what stops six moves in a row feeling like one long one.
+PANS = [
+    (0.0, -1.0),   # push up
+    (1.0, 0.0),    # track right
+    (0.0, 1.0),    # push down
+    (-1.0, 0.0),   # track left
+    (0.7, -0.7),   # up and right
+    (-0.7, 0.7),   # down and left
+]
+
+
+def _kenburns_fc(cfg, dur_s, z, SW, SH, SX, SY, W, H, FPS, pan=(0.0, 0.0)):
     """Ken-Burns clip filter. The stage PNG is rendered at cfg['zoom_ss']x
     resolution while zoompan outputs at display size (SWxSH): the per-frame x/y
     integer rounding lands in the big source space, so it is sub-pixel after the
-    implicit downscale — no visible jitter/shake — at display-size render cost."""
+    implicit downscale — no visible jitter/shake — at display-size render cost.
+
+    `pan` is a unit direction the shot drifts in over its length. It is applied
+    inside the head-room the zoom has already opened, so the frame never runs
+    off the edge of the stage however long the shot is: at zoom z the visible
+    window is iw/z wide, leaving (iw - iw/z) of slack, and the drift uses at
+    most half of that either side of centre."""
+    px, py = pan
+    # 'on' is the output frame index; normalise it to 0..1 over the shot.
+    n = max(1.0, dur_s * FPS - 1)
+    tx = f"(on/{n:.3f})*2-1"                       # -1 .. +1 across the shot
+    x = (f"iw/2-(iw/zoom/2)+({px:.3f})*({tx})*(iw-iw/zoom)/2" if px else
+         "iw/2-(iw/zoom/2)")
+    y = (f"ih/2-(ih/zoom/2)+({py:.3f})*({tx})*(ih-ih/zoom)/2" if py else
+         "ih/2-(ih/zoom/2)")
     return (f"color=c={cfg['bg']}:s={W}x{H}:d={dur_s}:r={FPS}[bg];"
-            f"[0:v]zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+            f"[0:v]zoompan=z='{z}':x='{x}':y='{y}':"
             f"d=1:s={SW}x{SH}:fps={FPS}[zi];"
             f"[bg][zi]overlay={SX}:{SY}[bi];[bi][1:v]overlay=0:0[out]")
 
 
-def transition(i, n):
-    if n - 6 <= i <= n - 3:           # near-end application montage feels energetic
-        return ("slideleft", 0.35)
+def transition(i, n, cfg=None):
+    """How scene i arrives.
+
+    Was: half-second dissolves nearly everywhere. Two problems with that in a
+    feed. A long dissolve is a pause you cannot skip — it reads as the video
+    buffering, and it is paid on EVERY cut, so on a 13-scene reel it quietly
+    spends six seconds doing nothing. And a dissolve says "time passed", which
+    is the wrong sentence between two lines of one argument; a CUT says "and
+    another thing", which is the right one.
+
+    So: cut by default (a 0.12 s dissolve — xfade needs a non-zero duration and
+    at 0.12 it lands as a cut), with real moves saved for the two places a reel
+    earns them: the turn out of the hook, and the closing card.
+    """
+    td = (cfg or {}).get("xfade", 0.12)
     if i == 1:
-        return ("fade", 0.55)
-    return ("dissolve", 0.5)
+        return ("fade", min(0.30, td * 2.5))       # the hook releasing into the product
+    if i == n - 1:
+        return ("slideup", min(0.28, td * 2.2))    # the CTA arriving, not fading in
+    if i % 4 == 0:
+        return ("slideleft", td)                   # a beat every fourth cut, so it has rhythm
+    return ("dissolve", td)
 
 
 def _schedule(cfg, N, vlen):
@@ -496,7 +706,7 @@ def _schedule(cfg, N, vlen):
     min_gap = cfg["vo_min_gap"]
     starts, acc = [round(cfg["vo_offset"], 3)], sd[0]
     for i in range(1, N):
-        _, td = transition(i, N)
+        _, td = transition(i, N, cfg)
         appear = acc - td                          # when scene i visually appears (xfade offset)
         start = appear + cfg["vo_offset"]
         prev_end = starts[i - 1] + vlen[i - 1] + min_gap
@@ -524,10 +734,24 @@ def build(cfg, dur):
     base_logo, glow = build_logo(cfg)
     scrim = build_scrim(W)
 
-    # ---- language-independent Ken-Burns "stage": rendered at zoom_ss x resolution
-    # (contained with head-room, no crop). Hi-res source => jitter-free zoompan.
+    # ---- language-independent Ken-Burns "stage": rendered at zoom_ss x
+    # resolution. Hi-res source => jitter-free zoompan.
+    #
+    # HEAD-ROOM IS NOT THE ZOOM. It used to be: the picture was shrunk by 1/
+    # maxzoom so that even at full zoom nothing was ever cropped. That is a
+    # sound guarantee and it has a nasty property — raising the zoom to make the
+    # reel feel alive SHRINKS THE PICTURE. Going from 1.06 to 1.16 quietly took
+    # fourteen percent off every frame, on the format where screen area is
+    # scarcest, to protect against a crop that happens only at the very end of a
+    # move and that nobody has ever noticed in a Ken-Burns shot.
+    #
+    # So they are two knobs now. The stage is built with `zoom_headroom` (a
+    # little slack, default 1.06) and `maxzoom` is free to be as lively as the
+    # cut needs; past the head-room a move crops slightly into the picture at
+    # its extreme, which is what a camera push does.
     SS = cfg["zoom_ss"]; SGW, SGH = STAGE_W * SS, STAGE_H * SS
-    inner_w, inner_h = int(SGW / MZ) - 8 * SS, int(SGH / MZ) - 8 * SS
+    HR = max(1.0, float(cfg.get("zoom_headroom", 1.06)))
+    inner_w, inner_h = int(SGW / HR) - 8 * SS, int(SGH / HR) - 8 * SS
     # A scene's "image" may be a single filename OR a list of filenames: with a
     # list, the scene cuts between the images (equal splits, each with its own
     # Ken-Burns) so no visual holds longer than a few seconds — better retention.
@@ -539,7 +763,7 @@ def build(cfg, dur):
 
     def stage_for(img):
         if img not in _stage_cache:
-            p = f"{cfg['tmp_dir']}/stage_{_content_key('stage1', img, _file_key(os.path.join(cfg['images_dir'], img)), SS, MZ)}.png"
+            p = f"{cfg['tmp_dir']}/stage_{_content_key('stage1', img, _file_key(os.path.join(cfg['images_dir'], img)), SS, HR)}.png"
             if not os.path.exists(p):
                 prod = Image.open(os.path.join(cfg["images_dir"], img)).convert("RGBA")
                 prod = contain(prod, inner_w, inner_h)
@@ -566,15 +790,27 @@ def build(cfg, dur):
             ov.alpha_composite(base_logo, (lx, ly))
         d = ImageDraw.Draw(ov)
         if with_sub:
-            # subtitle: smaller + anchored just above the footer, so the zooming
-            # product photo stays the visual focus (less distraction => longer watch)
+            # The subtitle sits UNDER THE PICTURE, not down at the footer.
+            #
+            # It used to be anchored just above the footer, which cost twice.
+            # It left a dead slab between the image and the caption — the eye
+            # has to travel it on every line — and, worse, it put the caption
+            # in the bottom eighth of the frame, which is exactly where
+            # Instagram and TikTok lay their OWN interface: the account name,
+            # the caption, the audio strip. A subtitle there is a subtitle
+            # nobody can read on the platform it was made for.
+            #
+            # Anchored under the stage, it closes the gap and clears the UI.
+            # `sub_y` overrides if a layout genuinely wants it low.
             for sz in (38, 35, 32, 29, 26):
                 f = ImageFont.truetype(FEN[lang], sz); lines = wrap(d, text, f, 960)
                 if len(lines) <= 3:
                     break
             asc, desc = f.getmetrics(); lh = asc + desc + 6; th = lh * len(lines)
             pad_t, pad_b = 18, 14
-            sy = 1772 - 16 - pad_b - th             # pill bottom ~1756, just above footer (y=1772)
+            sy = cfg.get("sub_y") or (STAGE_Y + STAGE_H + 46 + pad_t)
+            # Never let a three-line caption run into the footer.
+            sy = min(sy, 1772 - 16 - pad_b - th)
             d.rounded_rectangle([70, sy - pad_t, W - 70, sy + th + pad_b], 24, fill=(6, 9, 14, 200))
             y = sy
             for ln in lines:
@@ -624,17 +860,36 @@ def build(cfg, dur):
                 print(f"  clip {lang}{i}: cached", flush=True)
                 clips.append(out); continue
             ovp = f"{cfg['tmp_dir']}/ov_{lang}_{i}.png"; overlay(disp, lang, gi, ovp)
-            total_frames = max(len(imgs), round(sd[i] * FPS))
-            base_f, extra = divmod(total_frames, len(imgs))
+
+            # A still may not hold longer than `max_hold`.
+            #
+            # This is the single change that stops a reel reading as a
+            # slideshow. A scene is as long as its line takes to say — often
+            # six or eight seconds — and parking one frame there for the whole
+            # time means the viewer finished looking at it in two and is now
+            # waiting. Where the scene has several images it already cuts
+            # between them; where it has one, the SAME still is re-staged as
+            # two or three shots with different moves, which gives the cut
+            # without needing another asset.
+            shots = list(stage[i])
+            hold = cfg.get("max_hold", 2.6)
+            if len(shots) == 1 and hold > 0 and sd[i] > hold * 1.35:
+                shots = shots * max(2, min(4, int(round(sd[i] / hold))))
+
+            total_frames = max(len(shots), round(sd[i] * FPS))
+            base_f, extra = divmod(total_frames, len(shots))
             parts = []
-            for j, sp in enumerate(stage[i]):
+            for j, sp in enumerate(shots):
                 fj = base_f + (1 if j < extra else 0)
                 pdur = fj / FPS
                 rate = (MZ - 1) / fj
                 z = (f"min(1.0+{rate:.6f}*on,{MZ})" if (i + j) % 2 == 0
                      else f"max({MZ}-{rate:.6f}*on,1.0)")       # alternate in / out
-                pout = out if len(imgs) == 1 else f"{cfg['tmp_dir']}/part_{lang}_{i}p{j}_{clip_key}.mp4"
-                fc = _kenburns_fc(cfg, pdur, z, STAGE_W, STAGE_H, STAGE_X, STAGE_Y, W, H, FPS)
+                # A different drift per shot, walked round the compass so
+                # consecutive moves never repeat — see PANS.
+                pan = PANS[(i * 2 + j) % len(PANS)]
+                pout = out if len(shots) == 1 else f"{cfg['tmp_dir']}/part_{lang}_{i}p{j}_{clip_key}.mp4"
+                fc = _kenburns_fc(cfg, pdur, z, STAGE_W, STAGE_H, STAGE_X, STAGE_Y, W, H, FPS, pan)
                 subprocess.run(["ffmpeg", "-y", "-loop", "1", "-t", f"{pdur:.4f}", "-i", sp,
                                 "-loop", "1", "-t", f"{pdur:.4f}", "-i", ovp, "-filter_complex", fc,
                                 "-map", "[out]", "-r", str(FPS), "-pix_fmt", "yuv420p", "-c:v", "libx264",
@@ -653,7 +908,7 @@ def build(cfg, dur):
             inp += ["-i", c]
         fcs, acc, last = [], sd[0], "0:v"
         for i in range(1, N):
-            tn, td = transition(i, N)
+            tn, td = transition(i, N, cfg)
             fcs.append(f"[{last}][{i}:v]xfade=transition={tn}:duration={td}:offset={acc - td:.3f}[v{i}]")
             acc += sd[i] - td; last = f"v{i}"
         vid = f"{cfg['tmp_dir']}/video_{lang}.mp4"
@@ -708,21 +963,49 @@ def build(cfg, dur):
         for i in range(N):
             gi = 0.55 + 0.45 * abs(math.sin(i * 0.9))
             ovp = f"{cfg['tmp_dir']}/ovm_{i}.png"; overlay("", bl[0], gi, ovp, with_sub=False)
-            frames = max(1, round(sd[i] * FPS)); rate = (MZ - 1) / frames
-            z = f"min(1.0+{rate:.6f}*on,{MZ})" if i % 2 == 0 else f"max({MZ}-{rate:.6f}*on,1.0)"
             out = f"{cfg['tmp_dir']}/clipm_{i}.mp4"
-            fc = _kenburns_fc(cfg, sd[i], z, STAGE_W, STAGE_H, STAGE_X, STAGE_Y, W, H, FPS)
-            subprocess.run(["ffmpeg", "-y", "-loop", "1", "-t", str(sd[i]), "-i", stage[i],
-                            "-loop", "1", "-t", str(sd[i]), "-i", ovp, "-filter_complex", fc,
-                            "-map", "[out]", "-r", str(FPS), "-pix_fmt", "yuv420p", "-c:v", "libx264",
-                            "-preset", "veryfast", "-crf", "20", out], check=True, capture_output=True)
+            # `stage[i]` is a LIST of shots — always, even for a scene with one
+            # image, since multi-shot re-staging landed. This loop used to hand
+            # that list straight to ffmpeg as a path, so the master raised
+            # TypeError for EVERY config and the MKV was never written; the
+            # caller's try/except turned a total failure into one warning line.
+            # It now cuts the scene exactly the way the per-language path does,
+            # or the master would be a different edit of the same reel.
+            shots = list(stage[i])
+            hold = cfg.get("max_hold", 2.6)
+            if len(shots) == 1 and hold > 0 and sd[i] > hold * 1.35:
+                shots = shots * max(2, min(4, int(round(sd[i] / hold))))
+            total_frames = max(len(shots), round(sd[i] * FPS))
+            base_f, extra = divmod(total_frames, len(shots))
+            parts = []
+            for j, sp in enumerate(shots):
+                fj = base_f + (1 if j < extra else 0)
+                pdur = fj / FPS
+                rate = (MZ - 1) / fj
+                z = (f"min(1.0+{rate:.6f}*on,{MZ})" if (i + j) % 2 == 0
+                     else f"max({MZ}-{rate:.6f}*on,1.0)")
+                pan = PANS[(i * 2 + j) % len(PANS)]
+                pout = out if len(shots) == 1 else f"{cfg['tmp_dir']}/partm_{i}p{j}.mp4"
+                fc = _kenburns_fc(cfg, pdur, z, STAGE_W, STAGE_H, STAGE_X, STAGE_Y, W, H, FPS, pan)
+                subprocess.run(["ffmpeg", "-y", "-loop", "1", "-t", f"{pdur:.4f}", "-i", sp,
+                                "-loop", "1", "-t", f"{pdur:.4f}", "-i", ovp, "-filter_complex", fc,
+                                "-map", "[out]", "-r", str(FPS), "-pix_fmt", "yuv420p", "-c:v", "libx264",
+                                "-preset", "veryfast", "-crf", "20", pout], check=True, capture_output=True)
+                parts.append(pout)
+            if len(parts) > 1:
+                lst = f"{cfg['tmp_dir']}/ccm_{i}.txt"
+                with open(lst, "w") as f:
+                    for pth in parts:
+                        f.write(f"file '{os.path.abspath(pth)}'\n")
+                subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                                "-c", "copy", out], check=True, capture_output=True)
             clips.append(out)
         inp = []
         for c in clips:
             inp += ["-i", c]
         fcs, acc2, last = [], sd[0], "0:v"
         for i in range(1, N):
-            tn, td = transition(i, N)
+            tn, td = transition(i, N, cfg)
             fcs.append(f"[{last}][{i}:v]xfade=transition={tn}:duration={td}:offset={acc2 - td:.3f}[v{i}]")
             acc2 += sd[i] - td; last = f"v{i}"
         cleanvid = f"{cfg['tmp_dir']}/video_master.mp4"
